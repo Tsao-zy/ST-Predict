@@ -11,14 +11,49 @@ import pandas as pd
 import numpy as np
 from scipy import special
 import datetime
+import multiprocessing
 from sympy import Symbol, diff
 warnings.filterwarnings("ignore")
-#from cvxopt import matrix, solvers
-import json
-import multiprocessing
 from sklearn.neighbors import KDTree
 from scipy.spatial.distance import cdist
 from scipy.linalg import pinv as pinverse
+
+random.seed(100)
+
+
+
+
+
+def strDate2Timestamp(date_time, formats="%Y-%m-%d %H:%M:%S"):
+    '''
+
+    Parameters
+    ----------
+    date_time : TYPE
+        DESCRIPTION.
+    formats : TYPE, optional
+        DESCRIPTION. The default is "%Y-%m-%d %H:%M:%S".
+
+    Raises
+    ------
+    Exception
+        DESCRIPTION.
+
+    Returns
+    -------
+    timestamp : TYPE
+        DESCRIPTION.
+
+    '''
+    if type(date_time) is not str:
+        raise Exception("date time format is not a string.")
+    struct_time = time.strptime(date_time, formats)
+    timestamp = time.mktime(struct_time)
+    return int(timestamp)
+
+
+
+
 def mergeData(file_path, behavior="in"):
     '''
     Parameters
@@ -46,28 +81,52 @@ def mergeData(file_path, behavior="in"):
         else:
             df = pd.concat([df, day_data], ignore_index=True)
     df = df[["start_clock", "stationID", "flows", "lat", "lng"]]
+    df["start_clock"] = df["start_clock"].map(strDate2Timestamp)
     df.reset_index(inplace=True)
     return df
 
-def cut(file_path, behavior="in"):
-    start_tik = time.mktime(time.strptime("2019-01-01 06:00:00","%Y-%m-%d %H:%M:%S"))
-    left_start = int(start_tik // 600)
-    right_start = left_start + 103
+
+
+
+def cutZeroTime(file_path, behavior="in", start_time="2019-01-01 06:00:00"):
+    '''
+
+    Parameters
+    ----------
+    file_path : TYPE
+        DESCRIPTION.
+    behavior : TYPE, optional
+        DESCRIPTION. The default is "in".
+    start_time : TYPE, optional
+        DESCRIPTION. The default is "2019-01-01 06:00:00".
+
+    Returns
+    -------
+    df : TYPE
+        DESCRIPTION.
+
+    '''
+    start_tik = strDate2Timestamp(start_time)
+    start_10_minutes = int(start_tik // 600)
+    end_10_minutes = start_10_minutes + 103
     
-    string = []
-    for i in range(25):
-        for j in range(left_start, right_start):
-            string.append(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(j*600)))
-        left_start += 144
-        right_start += 144
-    df_time = pd.DataFrame(string, columns=["start_clock"])
-    df_all = mergeData(file_path)
-    df = pd.merge(df_time, df_all, on="start_clock", how="inner")
+    timestamp_list = []
+    for day in range(25):
+        for Min_per10 in range(start_10_minutes, end_10_minutes):
+            timestamp_list.append(Min_per10*600)
+        start_10_minutes += 144
+        end_10_minutes += 144
+    df_timestamp = pd.DataFrame(timestamp_list, columns=["start_clock"])
+    df_all = mergeData(file_path, behavior=behavior)
+    df = pd.merge(df_timestamp, df_all, on="start_clock", how="inner")
     log_flow = np.log(df["flows"])
     log_flow[np.isneginf(log_flow)] = 0
     df["flows"] = log_flow
     df.drop(["index"],axis=1, inplace=True)
     return df
+
+
+
 
 def estimateMeanANOVA(st_data):
     '''
@@ -81,15 +140,16 @@ def estimateMeanANOVA(st_data):
 
     '''
     mu = st_data["flows"].mean()
+    st_data["hour_minute"] = st_data["start_clock"].map(lambda x:datetime.datetime.fromtimestamp(x).strftime("%H:%M:%S"))
 
-    temporal_level = st_data["start_clock"].unique()
+    temporal_level = st_data["hour_minute"].unique()
     spatio_level = st_data["stationID"].unique()
     
     temporal_effort = dict()
     spatio_effort = dict()
     
     for ttime in temporal_level:
-        part_data = st_data[st_data["start_clock"] == ttime]
+        part_data = st_data[st_data["hour_minute"] == ttime]
         temporal_effort[ttime] = part_data["flows"].mean()
 
     for location in spatio_level:
@@ -97,9 +157,39 @@ def estimateMeanANOVA(st_data):
         spatio_effort[location] = part_data["flows"].mean()
     return mu, temporal_effort, spatio_effort
 
-        
+
+
+
+def ANOVAProcessing(st_data):
+    '''
+
+    Parameters
+    ----------
+    st_data : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    st_arr : TYPE
+        DESCRIPTION.
+
+    '''
+    mu, temporal_effort, spatio_effort = estimateMeanANOVA(st_data)
+    st_arr = np.array(st_data.values)
+    
+    for i in range(len(st_arr)):
+        times = st_arr[i, 0]
+        time_key = datetime.datetime.fromtimestamp(times).strftime("%H:%M:%S")
+        time_mu = temporal_effort[time_key]
+        location_key = st_arr[i, 1]
+        location_mu = spatio_effort[location_key]
+        flows = st_arr[i, 2]
+        st_arr[i, 5] = flows - (time_mu + location_mu - mu)
+    return st_arr
 
     
+
+
 def getDerivativeSymbol(h_nonzero=True):
     '''
 
@@ -141,6 +231,8 @@ def getDerivativeSymbol(h_nonzero=True):
     return parameters_derivative_dict, str(C_h_u), str(comx) 
 
 
+
+
 def getConvFunc(a, b, beta, sigma, mu, h, nu, gamma):
     '''
 
@@ -177,7 +269,9 @@ def getConvFunc(a, b, beta, sigma, mu, h, nu, gamma):
         C_h_u = sigma * 2 * beta / (para1)**(nu) / para2
     return C_h_u
 
-        
+  
+
+      
 def gradient_g(s1, t1, s2, t2, a_hat, b_hat, beta_hat, sigma_hat):
     '''
     
@@ -203,7 +297,7 @@ def gradient_g(s1, t1, s2, t2, a_hat, b_hat, beta_hat, sigma_hat):
         h_zero = False
     parameters_derivative_dict, C_h_u, comx = getDerivativeSymbol(h_zero)
     h = np.sqrt(np.sum((s1 - s2)**2))
-    mu = abs((t1 - t2).seconds // 60)
+    mu = abs((t1 - t2) // 60)
     a = a_hat
     b = b_hat
     beta = beta_hat
@@ -221,27 +315,6 @@ def gradient_g(s1, t1, s2, t2, a_hat, b_hat, beta_hat, sigma_hat):
     return np.array([-gradient_a, -gradient_b, -gradient_beta, -gradient_sigma, gradient_sigma_e])
 
 
-
-def distance_k(s1, s2, t1, t2, flow1, flow2):
-    '''
-    Parameters
-    ----------
-    s1 : Array, space information about datapoint 1.
-    t1 : timestamp, time information about datapoint 1.
-    s2 : Array, space information about datapoint 2.
-    t2 : timestamp, time information about datapoint 1.
-    flow1 : integer or float, flow at time t1 and space s1.
-    flow2 : integer or float, flow at time t2 and space s2.
-
-    Returns
-    -------
-    integer or float, the flow difference between (s1, t1) and (s2, t2), where
-    equals to X(s1,t1) - X(s2, t2)
-
-    '''
-    flow1 = flow1
-    flow2 = flow2
-    return flow1 - flow2
 
 
 def caculateCEF(s1, t1, s2, t2, a, b, beta, sigma, sigma_e, flow1, flow2):
@@ -266,7 +339,7 @@ def caculateCEF(s1, t1, s2, t2, a, b, beta, sigma, sigma_e, flow1, flow2):
     CEF : float, Composite Estimating Function about (s1,t1) and (s2, t2).
     '''
     h = np.sqrt(np.sum((s1 - s2)**2))
-    mu = abs((t1 - t2).seconds // 60)
+    mu = abs((t1 - t2) // 60)
     para1 = a * a * mu * mu + 1
     para2 = a * a * mu * mu + beta
     if h == 0:
@@ -276,8 +349,10 @@ def caculateCEF(s1, t1, s2, t2, a, b, beta, sigma, sigma_e, flow1, flow2):
         C_h_u = (sigma * 2 * beta) * math.sqrt(x/2) * special.kv(0.5, x) / math.sqrt(para1) / para2 / special.gamma(0.5)
     variance_dk = 4 * sigma + 4 * sigma_e - 2 * C_h_u
     Gamma_k = variance_dk / 2
-    CEF = gradient_g(s1, t1, s2, t2, a, b, beta, sigma) / 2 / Gamma_k * (1 - distance_k(s1, s2, t1, t2,flow1, flow2)**2 / 2 / Gamma_k)
+    CEF = gradient_g(s1, t1, s2, t2, a, b, beta, sigma) / 2 / Gamma_k * (1 - (flow1 - flow2)**2 / 2 / Gamma_k)
     return CEF
+
+
 
 
 def caculatePhin(dataset, a, b, beta, sigma, sigma_e):
@@ -304,8 +379,8 @@ def caculatePhin(dataset, a, b, beta, sigma, sigma_e):
     for i in range(0, count, 2):
         s1 = np.array([dataset[i, 3], dataset[i, 4]])
         s2 = np.array([dataset[i + 1, 3], dataset[i + 1, 4]])
-        t1 = datetime.strptime(dataset[i, 0], "%Y-%m-%d %H:%M:%S")
-        t2 = datetime.strptime(dataset[i + 1, 0], "%Y-%m-%d %H:%M:%S")
+        t1 = dataset[i, 0]
+        t2 = dataset[i + 1, 0]
         flow1 = dataset[i, 5]
         flow2 = dataset[i + 1, 5]
         phi_n += caculateCEF(s1, t1, s2, t2, a, b, beta, sigma, sigma_e, flow1, flow2)
@@ -338,6 +413,8 @@ def subregionIndex(dataset):
         index_array = np.where(dataset[:, 0] == t)[0]
         time_index.append(index_array)
     return space_index, time_index
+
+
 
 
 def sampling(dataset, num, ratio, index_array, inter=False):
@@ -386,6 +463,9 @@ def sampling(dataset, num, ratio, index_array, inter=False):
             sample = np.vstack((sample, dataset[index_array[idx_d1][idx_d3]], dataset[index_array[idx_d2][idx_d4]]))
     return sample
 
+
+
+
 def subregion(dataset, ratio={"T": 0.25, "S": 0.25, "C": 0.5}, num=5000):
     '''
 
@@ -415,6 +495,9 @@ def subregion(dataset, ratio={"T": 0.25, "S": 0.25, "C": 0.5}, num=5000):
     interact_sample = sampling(dataset, num, ratio["C"], time_index_array, inter=True)
     
     return space_sample, time_sample, interact_sample
+
+
+
 
 def evaluateGammaCov(dataset, a, b, beta, sigma, sigma_e, size=5):
     '''
@@ -460,6 +543,9 @@ def evaluateGammaCov(dataset, a, b, beta, sigma, sigma_e, size=5):
         cnt[i, 2] += C_count
     return np.sum(cnt) * (size - 1) * np.cov(res.T), np.sum(cnt[:, 0]), np.sum(cnt[:, 1]), np.sum(cnt[:, 2])
 
+
+
+
 def evaluateGammaCovBoots(dataset, a, b, beta, sigma, sigma_e, kn=10):
     '''
 
@@ -502,15 +588,7 @@ def evaluateGammaCovBoots(dataset, a, b, beta, sigma, sigma_e, kn=10):
     diag_cnt = np.diag([Scount, Tcount, Ccount])
     sqrt_N = np.kron(diag_cnt, np.eye(5))
     return sqrt_N.dot(cov_hat).dot(sqrt_N)
-    # avg_gamma = np.mean(res, axis=0)
-    # cov_hat = (((res - avg_gamma).T).dot(np.diag(cnt)).dot((res - avg_gamma) ))/ size
-    # #cov_hat = np.average(res, weights=cnt, axis=0) * np.average(cnt)
-    # Tcount = 5000 * 0.25
-    # Scount = 5000 * 0.25
-    # Ccount = 5000 * 0.5
-    # diag_cnt = np.diag([Scount, Tcount, Ccount])
-    # sqrt_N = np.kron(diag_cnt, np.eye(5))
-    # return sqrt_N.dot(cov_hat).dot(sqrt_N)
+
     
 
     
@@ -544,36 +622,13 @@ def caculateQn(timeset, spaceset, interactset, a, b, beta, sigma, sigma_e, W_inv
     return Q_n
 
 
-# def optim(timeset, spaceset, interactset,
-#           init_a=1, init_b=1, init_beta=1, init_sigma=1, 
-#           init_sigma_e=1, setw=np.eye(15),
-#           a_range=np.arange(0, 5, 0.1), 
-#           b_range=np.arange(0, 4, 0.01), 
-#           beta_range=np.arange(0.5, 10.5, 0.5),
-#           sigma_range=np.arange(1, 21), 
-#           sigma_e_range=np.arange(1, 21)):
-#     best_estimator = np.array([init_a, init_b, init_beta, init_sigma, init_sigma_e])
-#     qn = caculateQn(timeset, spaceset, interactset, init_a, 
-#                     init_b, init_beta, init_sigma, init_sigma_e, setw)
-#     for a in a_range:
-#         for b in b_range:
-#             for beta in beta_range:
-#                 for sigma in sigma_range:
-#                     for sigma_e in sigma_e_range:
-#                         new_qn = caculateQn(timeset, spaceset, interactset, 
-#                                             a, b, beta, sigma, sigma_e, setw)
-#                         if qn > new_qn:
-#                             qn = new_qn
-#                             best_estimator = np.array([a, b, beta, sigma, sigma_e])
-#     return best_estimator
 
-
-def optimal_pso(all_in_st_arr, W_inv=np.eye(15)):
+def optimalPso(st_arr, W_inv=np.eye(15)):
     '''
 
     Parameters
     ----------
-    all_in_st_arr : TYPE
+    st_arr : TYPE
         DESCRIPTION.
     W_inv : TYPE, optional
         DESCRIPTION. The default is np.eye(15).
@@ -589,7 +644,7 @@ def optimal_pso(all_in_st_arr, W_inv=np.eye(15)):
     g_bests = []
     fit_g = []
     fitLists = []
-    spaceset, timeset, interactset = subregion(all_in_st_arr, num=5000)
+    spaceset, timeset, interactset = subregion(st_arr, num=5000)
     my_pso = PSO(pN=40, dim=5, max_iter=10, timeset=timeset, spaceset=spaceset, interactset=interactset,W_inv=W_inv)
     my_pso.init_population()
     fitList = my_pso.iterator()
@@ -599,6 +654,21 @@ def optimal_pso(all_in_st_arr, W_inv=np.eye(15)):
     return {"g_best": g_bests, "g_fit": fit_g}, fitLists
 
 
+
+
+def getTiksRange(tik, span=103):
+    
+    tiks_stamp = []
+    for i in range(144, 0, -1):
+        moment = tik - 600 * i
+        dtform = datetime.datetime.fromtimestamp(moment)
+        if (dtform.hour >= 23 and dtform.minute > 0) or dtform.hour < 6:
+            continue
+        else:
+            tiks_stamp.append(moment)
+    return tiks_stamp
+
+    
 
 
 def predict(a, b, beta, sigma, tik, loc, gis, kdt, cdist, arr, timeSpan=103):
@@ -638,16 +708,7 @@ def predict(a, b, beta, sigma, tik, loc, gis, kdt, cdist, arr, timeSpan=103):
     '''
     k = len(kdt.query_radius(gis[loc].reshape(1, -1), r=0.03)[0])
     distance_k, station_k = kdt.query(gis[loc].reshape(1, -1), k=k)
-
-    tiks = []
-    for i in range(144):
-        moment = datetime.datetime.strptime(tik, "%Y-%m-%d %H:%M:%S") - datetime.timedelta(minutes=144* 10 - 10 * i)
-        if (moment.hour >= 23 and moment.minute > 0) or moment.hour < 6:
-            continue
-        else:
-            tiks.append(moment.strftime("%Y-%m-%d %H:%M:%S"))
-    tiks_stamp = list(map(lambda x:time.mktime(time.strptime(x, "%Y-%m-%d %H:%M:%S")), tiks))
-    now_stamp = time.mktime(time.strptime(tik, "%Y-%m-%d %H:%M:%S"))
+    tiks_stamp = getTiksRange(tik)
     c_star = np.zeros((1, timeSpan*k))
     C_mid = 2 * sigma * np.eye(timeSpan*k, timeSpan*k)
     flow_value = np.zeros((timeSpan*k, 1))
@@ -664,13 +725,13 @@ def predict(a, b, beta, sigma, tik, loc, gis, kdt, cdist, arr, timeSpan=103):
             C_mid[i, j] = getConvFunc(a, b, beta, sigma, mu, h, nu, gamma)
     for i in range(timeSpan*k):
         loc_diff = i // timeSpan
-        tik_diff = abs(tiks_stamp[i%k] - now_stamp)
+        tik_diff = abs(tiks_stamp[i%k] - tik)
         h = distance_k[0, loc_diff]
         mu = tik_diff // 60
         c_star[0, i] = getConvFunc(a, b, beta, sigma, mu, h, nu, gamma)
     
     for i in range(k):
-        flow_value[(timeSpan*i):(timeSpan*(i+1)), 0] = arr[np.isin(arr[:,0], tiks) & np.isin(arr[:,1], loc), -1].astype("float")
+        flow_value[(timeSpan*i):(timeSpan*(i+1)), 0] = arr[np.isin(arr[:,0], tiks_stamp) & np.isin(arr[:,1], loc), -1].astype("float")
   
     return float(c_star.dot(pinverse(C_mid)).dot(flow_value))
 
@@ -678,7 +739,7 @@ def predict(a, b, beta, sigma, tik, loc, gis, kdt, cdist, arr, timeSpan=103):
 
 
 
-def predictAll(a, b, beta, sigma, all_in_st_arr, start_tik="2019-01-26 06:00:00"):
+def predictAll(a, b, beta, sigma, st_arr, start_tik=1548453600):
     '''
     
 
@@ -692,7 +753,7 @@ def predictAll(a, b, beta, sigma, all_in_st_arr, start_tik="2019-01-26 06:00:00"
         DESCRIPTION.
     sigma : TYPE
         DESCRIPTION.
-    all_in_st_arr : TYPE
+    st_arr : TYPE
         DESCRIPTION.
     start_tik : TYPE, optional
         DESCRIPTION. The default is "2019-01-26 06:00:00".
@@ -703,13 +764,13 @@ def predictAll(a, b, beta, sigma, all_in_st_arr, start_tik="2019-01-26 06:00:00"
         DESCRIPTION.
 
     '''
-    tiks_range = [(datetime.datetime.strptime(start_tik, "%Y-%m-%d %H:%M:%S") - 
-                   datetime.timedelta(minutes=144* 10 - 10 * i)).strftime("%Y-%m-%d %H:%M:%S")
-                  for i in range(103)]
-    local_time_arr = all_in_st_arr[np.isin(all_in_st_arr[:, 0], tiks_range)]
-    tiks_list = [(datetime.datetime.strptime(start_tik, "%Y-%m-%d %H:%M:%S") + 
-                 datetime.timedelta(minutes=10 * i)).strftime("%Y-%m-%d %H:%M:%S")
-                for i in range(103)]
+    tiks_range = getTiksRange(start_tik)
+    
+    local_time_arr = st_arr[np.isin(st_arr[:, 0], tiks_range)]
+    
+
+    tiks_list = [start_tik + 600 * i for i in range(103)]
+    
     gis = local_time_arr[:80, 3:5].astype("float")
     gis = np.vstack((gis[:54], np.array([float("Inf"),float("Inf")]), gis[54:]))
     kdt = KDTree(gis, leaf_size=10)
@@ -727,72 +788,67 @@ def predictAll(a, b, beta, sigma, all_in_st_arr, start_tik="2019-01-26 06:00:00"
 
 
 
-
-# ----------------------PSO参数设置---------------------------------
 class PSO:
     def __init__(self, timeset, spaceset, interactset, pN, dim, max_iter,
-                 W_inv=np.eye(15), w=0.8, c1=1.5, c2=1.5, fit=float("Inf")):  # 初始化类  设置粒子数量  位置信息维度  最大迭代次数
+                 W_inv=np.eye(15), w=0.8, c1=1.5, c2=1.5, fit=float("Inf")):
         self.w = w
         self.c1 = c1
         self.c2 = c2
-        self.pN = pN  # 粒子数量
-        self.dim = dim  # 搜索维度
-        self.max_iter = max_iter  # 迭代次数
-        self.X = np.zeros((self.pN, self.dim))  # 所有粒子的位置（还要确定取值范围）
+        self.pN = pN
+        self.dim = dim
+        self.max_iter = max_iter
+        self.X = np.zeros((self.pN, self.dim))
         self.a_range = (0, 10)
         self.b_range = (0, 5)
         self.beta_range = (0.01, 10)
         self.sigma_range = (0.01, 5)
         self.sigma_e_range = (0.01, 5)
-        self.V = np.zeros((self.pN, self.dim))  # 所有粒子的速度（还要确定取值范围）
+        self.V = np.zeros((self.pN, self.dim))
         self.a_v_range = (0.001, 0.5)
         self.b_v_range = (0.0001, 0.1)
         self.beta_v_range = (0.01, 1)
         self.sigma_v_range = (0.001, 0.01)
         self.sigma_e_v_range = (0.01, 0.5)
-        self.p_best = np.zeros((self.pN, self.dim))  # 个体经历的最佳位置
-        self.g_best = np.zeros((1, self.dim))  # 全局最佳位置
-        self.p_fit = np.zeros(self.pN)  # 每个个体的历史最佳适应值
-        self.fit = fit # 全局最佳适应值
+        self.p_best = np.zeros((self.pN, self.dim))
+        self.g_best = np.zeros((1, self.dim))
+        self.p_fit = np.zeros(self.pN)
+        self.fit = fit
         self.timeset = timeset
         self.spaceset = spaceset
         self.interactset = interactset
         self.W_inv = W_inv
-    # ---------------------目标函数Sphere函数-----------------------------
 
-    # ---------------------初始化种群----------------------------------
+
     def init_population(self):
 
-        for i in range(self.pN):  # 遍历所有粒子
+        for i in range(self.pN):
 
-            #for j in range(self.dim):  # 每一个粒子的纬度
             self.X[i][0] = random.uniform(self.a_range[0], self.a_range[1])
             self.X[i][1] = random.uniform(self.b_range[0], self.b_range[1])
             self.X[i][2] = random.uniform(self.beta_range[0], self.beta_range[1])
             self.X[i][3] = random.uniform(self.sigma_range[0], self.sigma_range[1])
-            self.X[i][4] = random.uniform(self.sigma_e_range[0], self.sigma_e_range[1])# 给每一个粒子的位置赋一个初始随机值（在一定范围内）
+            self.X[i][4] = random.uniform(self.sigma_e_range[0], self.sigma_e_range[1])
 
             self.V[i][0] = random.uniform(self.a_v_range[0], self.a_v_range[1])
             self.V[i][1] = random.uniform(self.b_v_range[0], self.b_v_range[1])
             self.V[i][2] = random.uniform(self.beta_v_range[0], self.beta_v_range[1])
             self.V[i][3] = random.uniform(self.sigma_v_range[0], self.sigma_v_range[1])
             self.V[i][4] = random.uniform(self.sigma_e_v_range[0], self.sigma_e_v_range[1])
-            #self.V[i][j] = random.uniform(-0.1, 0.1)  # 给每一个粒子的速度给一个初始随机值（在一定范围内）
 
-            self.p_best[i] = self.X[i]  # 把当前粒子位置作为这个粒子的最优位置
 
-            #tmp = self.function(self.X[i])  # 计算这个粒子的适应度值
+            self.p_best[i] = self.X[i]
+
             tmp = abs(caculateQn(self.timeset, self.spaceset, self.interactset,
                                  self.X[i][0], self.X[i][1], self.X[i][2],
                                  self.X[i][3], self.X[i][4], W_inv=self.W_inv))
-            self.p_fit[i] = tmp  # 当前粒子的适应度值作为个体最优值
+            self.p_fit[i] = tmp
 
-            if tmp < self.fit:  # 与当前全局最优值做比较并选取更佳的全局最优值
+            if tmp < self.fit:
 
                 self.fit = tmp
                 self.g_best = self.X[i]
 
-     # ---------------------更新粒子位置----------------------------------
+
 
     def iterator(self):
 
@@ -802,7 +858,6 @@ class PSO:
 
             for i in range(self.pN):
 
-                # 更新速度
                 self.V[i] = self.w * self.V[i] + self.c1 * random.uniform(0,1) * (self.p_best[i] - self.X[i]) + \
                             (self.c2 * random.uniform(0,1) * (self.g_best - self.X[i]))
 
@@ -817,7 +872,6 @@ class PSO:
                 self.V[i][4] = min(self.sigma_e_v_range[1], self.V[i][4])
                 self.V[i][4] = max(self.sigma_e_v_range[0], self.V[i][4])
 
-                # 更新位置
                 self.X[i] = self.X[i] + self.V[i]
 
                 self.X[i][0] = min(self.a_range[1], self.X[i][0])
@@ -831,23 +885,22 @@ class PSO:
                 self.X[i][4] = min(self.sigma_e_range[1], self.X[i][4])
                 self.X[i][4] = max(self.sigma_e_range[0], self.X[i][4])
 
-            for i in range(self.pN):  # 更新gbest\pbest
+            for i in range(self.pN):
 
-                #temp = self.function(self.X[i])
                 temp = abs(caculateQn(self.timeset, self.spaceset, self.interactset,
                                       self.X[i][0], self.X[i][1], self.X[i][2],
                                       self.X[i][3], self.X[i][4], W_inv=self.W_inv))
 
-                if temp < self.p_fit[i]:  # 更新个体最优
+                if temp < self.p_fit[i]:
                     self.p_best[i] = self.X[i]
                     self.p_fit[i] = temp
 
-                if temp < self.fit:  # 更新全局最优
+                if temp < self.fit:
                     self.g_best = self.X[i]
                     self.fit = temp
 
             fitness.append(self.fit)
-            print(t, self.fit)  # 输出最优值
+            print(t, self.fit)
 
         return fitness
 
@@ -855,91 +908,64 @@ class PSO:
 
 if __name__ == "__main__":
     
-    # file_path = "G:/2-Graduate Document/thesis/dataset/datasets_Oper/"
-    # #file_path = 
-    # all_in_st_data = cut(file_path)
-    # mu, temporal_effort, spatio_effort = estimateMeanANOVA(all_in_st_data)
-    # all_in_st_data["flows_no_mean"] = 0
-    # all_in_st_arr = np.array(all_in_st_data)
     
-    # for i in range(len(all_in_st_arr)):
-    #     time_key = all_in_st_arr[i, 0]
-    #     time_mu = temporal_effort[time_key]
-    #     location_key = all_in_st_arr[i, 1]
-    #     location_mu = spatio_effort[location_key]
-    #     flows = all_in_st_arr[i, 2]
-    #     all_in_st_arr[i, 5] = flows - (time_mu + location_mu - mu)
-    # #filepath = "/Users/ls_stat/CZY/"
-    # filepath = "/cluster/home/ls_stat/CZY/all_in_st_arr.npy"
-    # filepath = "D:/czy/testing.npy"
-    # all_in_st_arr = np.load(filepath, allow_pickle=True)
-    # #all_in_st_arr = np.load(filepath)
-    # space_sample, time_sample, interact_sample = subregion(all_in_st_arr)
-    #bst_est = optim(timeset=space_sample,
-    #                spaceset=space_sample,
-    #                interactset=interact_sample)
-    #bst_est_dict = dict(zip(["a", "b", "beta", "sigma", "sigma_e"], bst_est))
-    #est_js = json.dumps(bst_est_dict, indent=4)  # indent参数是换行和缩进
-   
-    #fo = open('/Users/ls_stat/CZY/best_estimator_for_weight.json', 'w')
-    #fo.write(est_js)
-    #fo.close()
-    
-    
-    # est_weight_info = optimal_pso(timeset=time_sample, spaceset=space_sample, interactset=interact_sample)
-    # np.save("/cluster/home/ls_stat/CZY/est_info.npy", est_weight_info)
-    
-    
-    
-    # caculateQn(timeset=time_sample, spaceset=space_sample, 
-    #            interactset=interact_sample, a=1, b=2, 
-    #            beta=3, sigma=9, sigma_e=1)
-    # t1 = datetime.strptime(all_in_st_arr[1, 0], "%Y-%m-%d %H:%M:%S")
-    # t2 = datetime.strptime(all_in_st_arr[100, 0], "%Y-%m-%d %H:%M:%S")
-    # gradient_g(np.array([10,12]), t1, np.array([9,21]), t2, 0.3, 2, 3, 4)
-    # caculateCEF(np.array([10,12]), t1, np.array([9,21]), t2, 0.3, 2, 3, 4, 10, 23, 3324)
- 
-    
- 
-    # w = evaluateGammaCovBoots(dataset=all_in_st_arr, a=4.78858005, 
-    #                      b=4.31989921, beta=3.97813599, 
-    #                      sigma=4.81582039, sigma_e=5) 
-    # np.save("D:/czy/weight.npy", w)
-    
-    
-    filepath = "D:/czy/testing.npy"
-    all_in_st_arr = np.load(filepath, allow_pickle=True)
-    #w = np.load("D:/czy/weight.npy")
-    #W_inv = np.linalg.pinv(w)
-    
-    
-    
+    """
+    estimate parameters for weight matrix
+    """
     start = time.time()
-
-    #result, fitness = optimal_pso(all_in_st_arr, W_inv)
+    # file_path = "D:/datasets/"
+    # st_data = cutZeroTime(file_path)
+    # st_arr = ANOVAProcessing(st_data)
+    # space_sample, time_sample, interact_sample = subregion(st_arr)
+    # W_inv=np.eye(15)
     
-    #pools = multiprocessing.Pool(processes=6)
-    #results = [pools.apply_async(optimal_pso, args=(all_in_st_arr, W_inv)) for i in range(6)]
-    #result = [p.get() for p in results]
+    # cpu_num = 8 
+    # pools = multiprocessing.Pool(processes=cpu_num)
+    # results = [pools.apply_async(optimalPso, args=(st_arr, W_inv)) for i in range(cpu_num)]
+    # result = [p.get() for p in results]
 
-    #pools.close()
-    #pools.join()
- 
-    #est_weight_info = optimal_pso(timeset=time_sample, spaceset=space_sample, interactset=interact_sample, W_inv=W_inv)
-    #np.save("D:/czy/est_info.npy", result)
-    #np.save("D:/czy/est_fitness.npy", fitness)
+    # pools.close()
+    # pools.join()
+    # np.save("D:/czy/est_parameter_for_weight.npy", result)
 
 
-    a = 1.415470645138922290e+00
-    b = 1.848971147251750935e+00
-    beta = 7.013283637640848056e+00
-    sigma = 4.458254386223678978e+00
-    sigma_e = 1.480545408869228918e+00
-    pred_arr = predictAll(a, b, beta, sigma, all_in_st_arr)
-    np.save("D:/czy/pred_arr.npy", pred_arr)
+    """
+    estimate weight matrix using upon parameters
     
+    """
+    # idx = min((result[i, 0]["g_fit"], i) for i in range(cpu_num))
+    # a, b, beta, sigma, sigma_e = result[1, 0]["g_best"][0]
+    
+    # w = evaluateGammaCovBoots(dataset=all_in_st_arr, a=a, b=b, beta=beta, 
+    #                           sigma=sigma, sigma_e=sigma_e)
+    # np.save("D:/czy/est_weight.npy", w)
+    
+    
+    """
+    re-estimated parameters by using upon weight matrix
+    """
+    # W_inv = pinverse(w)
+    
+    # cpu_num = 8 
+    # pools = multiprocessing.Pool(processes=cpu_num)
+    # results = [pools.apply_async(optimalPso, args=(st_arr, W_inv)) for i in range(cpu_num)]
+    # result = [p.get() for p in results]
+
+    # pools.close()
+    # pools.join()
+    # np.save("D:/czy/est_parameter_using_estimated_weight.npy", result)
+    
+    
+    """
+    predict by using upon re-estimated parameters
+    """
+    # idx = min((result[i, 0]["g_fit"], i) for i in range(cpu_num))
+    # a, b, beta, sigma, sigma_e = result[1, 0]["g_best"][0]
+    # pred_arr = predictAll(a, b, beta, sigma, st_arr)
+    # np.save("D:/czy/prediction_array.npy", pred_arr)
+
+
     end = time.time()
-    
     print(end - start)
     
     
